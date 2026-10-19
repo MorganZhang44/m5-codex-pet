@@ -4,7 +4,7 @@
 #include "pet_config.local.h"
 #endif
 
-// Missing private configuration compiles into an offline display.
+// Runtime NVS provisioning is the default; these are optional migration/fallbacks.
 #ifndef PET_WIFI_SSID
 #define PET_WIFI_SSID ""
 #endif

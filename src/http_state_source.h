@@ -1,12 +1,12 @@
 #pragma once
 
 #include <stdint.h>
-#include "pet_state.h"
+#include "status_data.h"
+#include "network_policy.h"
 
 namespace HttpStateSource {
-void begin();
-// True only when a valid service state was received; otherwise leave state alone.
-bool poll(uint32_t now, PetState& state);
-// Most recent poll succeeded (independent of the pet's agent-loop state).
-bool connected();
+void begin(bool maintenance = false);
+// True only when a valid full snapshot was received; otherwise leave it alone.
+bool poll(uint32_t now, StatusData& status);
+TransportState transport();
 }  // namespace HttpStateSource

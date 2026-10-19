@@ -3,27 +3,55 @@
 
 namespace {
 PetState currentState = PetState::SLEEP;
-bool connected = false;
+TransportState transport = TransportState::CONNECTING;
+LastResult lastResult = LastResult::NONE;
+Usage currentUsage;
 
 constexpr uint16_t kBackground = TFT_BLACK;
 constexpr uint16_t kMuted = 0x8410;
 
 void renderConnection() {
   auto& lcd = M5.Display;
-  lcd.fillRect(0, 222, lcd.width(), 10, kBackground);
-  lcd.setTextColor(connected ? kMuted : TFT_YELLOW, kBackground);
-  lcd.drawCenterString(connected ? "STATUS ONLINE" : "STATUS OFFLINE",
-                       lcd.width() / 2, 222);
+  const char* label = "CONNECTING";
+  if (transport == TransportState::ONLINE) label = "ONLINE";
+  else if (transport == TransportState::OFFLINE) label = "OFFLINE";
+  else if (transport == TransportState::SETUP) label = "SETUP";
+  lcd.fillRect(0, 227, lcd.width(), 10, kBackground);
+  lcd.setTextColor(transport == TransportState::ONLINE ? kMuted : TFT_YELLOW, kBackground);
+  lcd.drawCenterString(label, lcd.width() / 2, 227);
 }
 
-void drawUsageRow(const char* label, int percent, int y) {
+void renderHistory() {
+  auto& lcd = M5.Display;
+  lcd.fillRect(0, 213, lcd.width(), 10, kBackground);
+  lcd.setTextColor(kMuted, kBackground);
+  lcd.drawCenterString(lastResult == LastResult::SUCCESS ? "LAST OK" :
+                       lastResult == LastResult::FAILED ? "LAST FAIL" : "LAST --",
+                       lcd.width() / 2, 213);
+}
+
+void drawUsageRow(const char* label, double percent, int y) {
   auto& lcd = M5.Display;
   const int barWidth = lcd.width() - 16;
   lcd.setTextColor(TFT_WHITE, kBackground);
   lcd.setCursor(8, y);
-  lcd.printf("%s      %d%%", label, percent);
+  if (percent < 0) lcd.printf("%s      --%%", label);
+  else lcd.printf("%s      %.0f%%", label, percent);
   lcd.drawRect(8, y + 13, barWidth, 9, kMuted);
-  lcd.fillRect(9, y + 14, (barWidth - 2) * percent / 100, 7, TFT_CYAN);
+  if (percent >= 0) {
+    lcd.fillRect(9, y + 14, static_cast<int>((barWidth - 2) * percent / 100),
+                 7, TFT_CYAN);
+  }
+}
+
+void renderUsage() {
+  auto& lcd = M5.Display;
+  lcd.fillRect(0, 0, lcd.width(), 96, kBackground);
+  lcd.setTextColor(currentUsage.stale ? TFT_YELLOW : TFT_WHITE, kBackground);
+  lcd.drawCenterString(currentUsage.stale ? "USAGE STALE" : "USAGE",
+                       lcd.width() / 2, 8);
+  drawUsageRow("5h", currentUsage.fiveHour, 28);
+  drawUsageRow("7d", currentUsage.sevenDay, 61);
 }
 
 void renderPet(PetState state) {
@@ -81,6 +109,7 @@ void renderPet(PetState state) {
   }
   lcd.setTextColor(color, kBackground);
   lcd.drawCenterString(label, cx, 195);
+  renderHistory();
   renderConnection();
 }
 }  // namespace
@@ -92,12 +121,12 @@ void PetUi::begin() {
   M5.Display.setTextSize(1);
   M5.Display.fillScreen(kBackground);
   M5.Display.setTextColor(TFT_WHITE, kBackground);
-  M5.Display.drawCenterString("USAGE (MOCK)", M5.Display.width() / 2, 8);
-  drawUsageRow("5h", 42, 28);
-  drawUsageRow("7d", 68, 61);
+  currentUsage = Usage{};
+  renderUsage();
   M5.Display.drawFastHLine(8, 96, M5.Display.width() - 16, kMuted);
   currentState = PetState::SLEEP;
-  connected = false;
+  transport = TransportState::CONNECTING;
+  lastResult = LastResult::NONE;
   renderPet(currentState);
 }
 
@@ -107,8 +136,33 @@ void PetUi::setState(PetState state) {
   renderPet(state);
 }
 
-void PetUi::setConnected(bool value) {
-  if (connected == value) return;
-  connected = value;
+void PetUi::setTransport(TransportState value) {
+  if (transport == value) return;
+  transport = value;
   renderConnection();
+}
+
+void PetUi::setLastResult(LastResult result) {
+  if (lastResult == result) return;
+  lastResult = result;
+  renderHistory();
+}
+
+void PetUi::showSetup(const char* apName) {
+  auto& lcd = M5.Display;
+  lcd.fillScreen(kBackground);
+  lcd.setTextColor(TFT_YELLOW, kBackground);
+  lcd.setCursor(4, 12);
+  lcd.print("SETUP WI-FI");
+  lcd.setTextColor(TFT_WHITE, kBackground);
+  lcd.setCursor(4, 40);
+  lcd.print("Join Wi-Fi:\n");
+  lcd.println(apName);
+  lcd.print("\nOpen browser:\nhttp://192.168.4.1\n\nSave Wi-Fi to restart.\n\nBoot: hold BtnA\nto reconfigure.");
+}
+
+void PetUi::setUsage(const Usage& usage) {
+  if (usage == currentUsage) return;
+  currentUsage = usage;
+  renderUsage();
 }
