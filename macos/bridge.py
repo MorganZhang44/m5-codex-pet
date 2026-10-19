@@ -12,7 +12,35 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 STATES = ('SLEEP', 'RUNNING', 'SUCCESS', 'FAILED')
 RESULTS = ('SUCCESS', 'FAILED')
 USAGE_TTL = 600
-SCAN_INTERVAL = 30
+SCAN_INTERVAL = 2
+READ_LIMIT = 262144
+RUNNING_TTL = 900  # Inactivity lease, never evidence of failure.
+RESULT_TTL = 30
+
+
+def lifecycle_event(event):
+    """Project only explicit persisted turn boundaries, never transcript content."""
+    if not isinstance(event, dict) or event.get('type') != 'event_msg':
+        return None
+    payload = event.get('payload')
+    observed = timestamp(event.get('timestamp'))
+    if not isinstance(payload, dict) or observed is None:
+        return None
+    kind = payload.get('type')
+    if kind not in ('task_started', 'task_complete', 'turn_aborted'):
+        return None
+    turn = payload.get('turn_id')
+    if turn is not None and (not isinstance(turn, str) or not turn):
+        return None
+    state = {'task_started': 'RUNNING', 'task_complete': 'SUCCESS',
+             'turn_aborted': 'SLEEP'}[kind]
+    # Newer Codex versions persist a terminal ErrorEvent on task_complete.
+    # Older versions may omit errors entirely; standalone error events are not
+    # reliably terminal and must not manufacture a failed result.
+    if kind == 'task_complete' and payload.get('error') is not None:
+        error = payload['error']
+        state = 'FAILED' if isinstance(error, dict) and isinstance(error.get('message'), str) else 'SLEEP'
+    return observed, turn, state
 
 
 def publish_identity(support):
@@ -110,30 +138,74 @@ class LocalSource:
         self.lock = threading.Lock()
         self.next_scan = 0
         self.usage = None
+        self.files = {}
+        self.last_terminal = None
+        self.last_result = None
 
-    def scan_usage(self):
+    def scan_sessions(self):
         # Only session JSONL, never auth.json, config, databases or credentials.
         try:
-            paths = sorted((p for p in self.sessions.glob('**/*.jsonl') if not p.is_symlink()),
-                           key=lambda p: p.stat().st_mtime, reverse=True)[:20]
+            paths = []
+            for path in self.sessions.glob('**/*.jsonl'):
+                parents = (self.sessions / parent for parent in path.relative_to(self.sessions).parents)
+                if not path.is_symlink() and not any(parent.is_symlink() for parent in parents):
+                    paths.append(path)
+            paths = sorted(paths, key=lambda p: p.stat().st_mtime, reverse=True)[:20]
         except OSError:
             return
+        self.files = {p: value for p, value in self.files.items() if p in paths}
         latest = None
         for path in paths:
             try:
                 with path.open('rb') as stream:
+                    stat = path.stat()
                     size = stream.seek(0, 2)
-                    stream.seek(max(0, size - 262144))
-                    if size > 262144:
-                        stream.readline()  # Drop partial first line.
-                    lines = stream.read(262144).splitlines()
+                    cached = self.files.get(path)
+                    if (cached is None or cached['identity'] != (stat.st_dev, stat.st_ino)
+                            or size < cached['offset'] or size - cached['offset'] > READ_LIMIT):
+                        cached = dict(identity=(stat.st_dev, stat.st_ino),
+                                      offset=max(0, size - READ_LIMIT), active=None)
+                        self.files[path] = cached
+                    stream.seek(cached['offset'])
+                    skip_first = cached['offset'] and cached.get('partial_start', True)
+                    cached['partial_start'] = False
+                    data = stream.read(READ_LIMIT)
+                    # Leave an incomplete append for the next poll.
+                    end = data.rfind(b'\n') + 1
+                    cached['offset'] = stream.tell() - len(data) + end
+                    lines = data[:end].splitlines()
+                    if skip_first:
+                        lines = lines[1:]  # Drop the bounded tail's first fragment.
                 for line in lines:
                     try:
-                        usage = usage_event(json.loads(line))
+                        event = json.loads(line)
                     except (ValueError, UnicodeError):
                         continue
+                    usage = usage_event(event)
                     if usage and usage[0] <= self.clock() + 60 and (latest is None or usage[0] > latest[0]):
                         latest = usage
+                    boundary = lifecycle_event(event)
+                    observed = timestamp(event.get('timestamp')) if isinstance(event, dict) else None
+                    if observed is None or observed > self.clock() + 60:
+                        continue
+                    if boundary:
+                        when, turn, state = boundary
+                        active = cached['active']
+                        if state == 'RUNNING':
+                            cached['active'] = (when, turn)
+                        elif active is None or turn is None or active[1] is None or turn == active[1]:
+                            cached['active'] = None
+                            terminal = (when, state)
+                            if self.last_terminal is None or when >= self.last_terminal[0]:
+                                self.last_terminal = terminal
+                            if state in RESULTS and (self.last_result is None or when >= self.last_result[0]):
+                                self.last_result = terminal
+                    elif (cached['active'] and isinstance(event, dict)
+                          and event.get('type') == 'event_msg'):
+                        # Structured progress renews an already observed start;
+                        # activity alone can never start a task.
+                        when, turn = cached['active']
+                        cached['active'] = (max(when, observed), turn)
             except OSError:
                 continue
         if latest and (self.usage is None or latest[0] >= self.usage[0]):
@@ -143,15 +215,25 @@ class LocalSource:
         with self.lock:
             now = self.clock()
             if now >= self.next_scan:
-                self.scan_usage()
+                self.scan_sessions()
                 self.next_scan = now + SCAN_INTERVAL
             state = read_json(self.support / 'state.json')
             state = state if isinstance(state, dict) else {}
             current = state.get('state')
             expires = state.get('expires_at')
-            if current not in STATES or not finite(expires) or now >= expires:
+            explicit = current in STATES and finite(expires) and now < expires
+            if not explicit:
                 current = 'SLEEP'
+                if any(value['active'] and now - value['active'][0] < RUNNING_TTL
+                       for value in self.files.values()):
+                    current = 'RUNNING'
+                elif self.last_terminal and now - self.last_terminal[0] < RESULT_TTL:
+                    current = self.last_terminal[1]
             last = state.get('last_result')
+            updated = state.get('updated_at')
+            if (self.last_result and not explicit and
+                    (last not in RESULTS or not finite(updated) or self.last_result[0] >= updated)):
+                last = self.last_result[1]
             reply = dict(state=current, last_result=last if last in RESULTS else None,
                          usage_5h_percent=None, usage_7d_percent=None,
                          usage_observed_at=None, usage_stale=True,

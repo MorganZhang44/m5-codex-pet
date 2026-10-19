@@ -169,6 +169,20 @@ class PackageTest(unittest.TestCase):
         self.assertEqual(source.snapshot()['state'], 'SLEEP')
         self.assertIsNone(source.snapshot()['last_result'])
 
+    def test_cli_case_insensitive_canonical_storage(self):
+        self.paths['support'].mkdir(parents=True)
+        with patch.object(codex_pet, 'support_path', return_value=self.paths['support']):
+            for value in ('running', 'success', 'fAiLeD', 'sleep', 'RUNNING'):
+                self.assertEqual(codex_pet.main(['state', value]), 0)
+                stored = bridge.read_json(self.paths['support'] / 'state.json')
+                self.assertEqual(stored['state'], value.upper())
+                if value.upper() in bridge.RESULTS:
+                    self.assertEqual(stored['last_result'], value.upper())
+            before = (self.paths['support'] / 'state.json').read_bytes()
+            with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                codex_pet.main(['state', 'unknown'])
+            self.assertEqual((self.paths['support'] / 'state.json').read_bytes(), before)
+
 
 class BridgeTest(unittest.TestCase):
     def setUp(self):
@@ -259,6 +273,131 @@ class BridgeTest(unittest.TestCase):
         for path in ('/', '/status?other=1', '/state'):
             self.assertIn(b'404 Not Found', request('GET', path))
         self.assertIn(b'501 Unsupported method', request('POST', '/status'))
+
+    def lifecycle(self, kind, turn='one', **extra):
+        return {'type': 'event_msg', 'timestamp': bridge.reset_time(self.now),
+                'payload': dict(type=kind, turn_id=turn, **extra)}
+
+    def append(self, path, event):
+        with path.open('a') as stream:
+            stream.write(json.dumps(event) + '\n')
+        self.now += bridge.SCAN_INTERVAL
+
+    def test_automatic_boundaries_progress_and_restart(self):
+        path = self.write_event(self.lifecycle('task_started'))
+        self.assertEqual(self.source.snapshot()['state'], 'RUNNING')
+        # Start stays in memory even after it leaves the bounded tail.
+        for _ in range(3):
+            self.append(path, self.lifecycle('agent_message', message='x' * 100000))
+            self.assertEqual(self.source.snapshot()['state'], 'RUNNING')
+        self.append(path, self.lifecycle('task_complete'))
+        self.assertEqual(self.source.snapshot()['state'], 'SUCCESS')
+        restarted = bridge.LocalSource(self.home, self.home / '.codex', clock=lambda: self.now)
+        self.assertEqual(restarted.snapshot()['last_result'], 'SUCCESS')
+        self.now += bridge.RESULT_TTL
+        self.assertEqual(self.source.snapshot()['state'], 'SLEEP')
+        self.assertEqual(self.source.snapshot()['last_result'], 'SUCCESS')
+
+    def test_cancellation_and_failure_are_not_guessed(self):
+        path = self.write_event(self.lifecycle('task_started'))
+        self.source.snapshot()
+        for kind in ('error', 'stream_error', 'exec_command_end'):
+            self.append(path, self.lifecycle(kind, message='failed', exit_code=1))
+            self.assertEqual(self.source.snapshot()['state'], 'RUNNING')
+        self.append(path, self.lifecycle('turn_aborted', reason='interrupted'))
+        self.assertEqual(self.source.snapshot()['state'], 'SLEEP')
+        self.assertIsNone(self.source.snapshot()['last_result'])
+        self.append(path, self.lifecycle('task_started', turn='two'))
+        self.append(path, self.lifecycle('task_complete', turn='two', error={'message': 'terminal error'}))
+        self.assertEqual(self.source.snapshot()['state'], 'FAILED')
+        self.assertEqual(self.source.snapshot()['last_result'], 'FAILED')
+
+    def test_concurrent_turn_matching_and_inactivity_lease(self):
+        first = self.write_event(self.lifecycle('task_started'))
+        second = first.with_name('other.jsonl')
+        second.write_text(json.dumps(self.lifecycle('task_started', turn='two')) + '\n')
+        self.source.snapshot()
+        self.append(first, self.lifecycle('task_complete'))
+        self.assertEqual(self.source.snapshot()['state'], 'RUNNING')
+        self.assertEqual(self.source.snapshot()['last_result'], 'SUCCESS')
+        self.append(second, self.lifecycle('task_complete', turn='wrong'))
+        self.assertEqual(self.source.snapshot()['state'], 'RUNNING')
+        self.now += bridge.RUNNING_TTL
+        self.assertEqual(self.source.snapshot()['state'], 'SLEEP')
+        self.assertEqual(self.source.snapshot()['last_result'], 'SUCCESS')
+
+    def test_partial_append_truncation_and_explicit_precedence(self):
+        path = self.write_event(self.lifecycle('task_started'))
+        self.source.snapshot()
+        terminal = json.dumps(self.lifecycle('task_complete')).encode()
+        with path.open('ab') as stream:
+            stream.write(terminal[:30])
+        self.now += bridge.SCAN_INTERVAL
+        self.assertEqual(self.source.snapshot()['state'], 'RUNNING')
+        with path.open('ab') as stream:
+            stream.write(terminal[30:] + b'\n')
+        self.now += bridge.SCAN_INTERVAL
+        self.assertEqual(self.source.snapshot()['state'], 'SUCCESS')
+        bridge.atomic_json(self.home / 'state.json', {'state': 'SLEEP', 'expires_at': self.now + 5})
+        self.assertEqual(self.source.snapshot()['state'], 'SLEEP')
+        self.now += 6
+        self.assertEqual(self.source.snapshot()['state'], 'SUCCESS')
+        path.write_text('{}\n')
+        self.now += bridge.RESULT_TTL
+        self.assertEqual(self.source.snapshot()['state'], 'SLEEP')
+
+    def test_unknown_future_missing_and_symlink_signals(self):
+        for event in ([], {}, self.lifecycle('turn.started'),
+                      self.lifecycle('task_complete', error='bad'),
+                      self.lifecycle('task_started', turn=[])):
+            result = bridge.lifecycle_event(event)
+            self.assertTrue(result is None or result[2] == 'SLEEP')
+        future = self.lifecycle('task_started')
+        future['timestamp'] = bridge.reset_time(self.now + 120)
+        path = self.write_event(future)
+        self.assertEqual(self.source.snapshot()['state'], 'SLEEP')
+        path.unlink()
+        private = self.home / 'private.jsonl'
+        private.write_text(json.dumps(self.lifecycle('task_started')) + '\n')
+        path.symlink_to(private)
+        self.now += bridge.SCAN_INTERVAL
+        self.assertEqual(self.source.snapshot()['state'], 'SLEEP')
+        path.unlink()
+        private.unlink()
+        # Older boundaries without turn IDs still work within their session.
+        self.write_event(self.lifecycle('task_started', turn=None))
+        self.now += bridge.SCAN_INTERVAL
+        self.assertEqual(self.source.snapshot()['state'], 'RUNNING')
+
+    def test_bounded_tail_gap_and_eviction_fail_safe(self):
+        path = self.write_event(self.lifecycle('task_started'))
+        self.assertEqual(self.source.snapshot()['state'], 'RUNNING')
+        # Missing data may include a terminal boundary: do not retain RUNNING.
+        self.append(path, self.lifecycle('agent_message', message='x' * (bridge.READ_LIMIT + 10)))
+        self.assertEqual(self.source.snapshot()['state'], 'SLEEP')
+        self.append(path, self.lifecycle('token_count'))
+        self.assertEqual(self.source.snapshot()['state'], 'SLEEP')
+        # A new explicit start restores detection after the skipped region.
+        self.append(path, self.lifecycle('task_started', turn='new'))
+        self.assertEqual(self.source.snapshot()['state'], 'RUNNING')
+        os.utime(path, (self.now - 1, self.now - 1))
+        for index in range(20):
+            other = path.with_name(str(index) + '.jsonl')
+            other.write_text('{}\n')
+            os.utime(other, (self.now + index, self.now + index))
+        self.now += bridge.SCAN_INTERVAL
+        self.assertEqual(self.source.snapshot()['state'], 'SLEEP')
+        self.assertNotIn(path, self.source.files)
+
+    def test_history_and_cancellation_across_turns(self):
+        path = self.write_event(self.lifecycle('task_complete'))
+        self.source.snapshot()
+        self.append(path, self.lifecycle('task_started', turn='next'))
+        self.assertEqual(self.source.snapshot()['state'], 'RUNNING')
+        self.assertEqual(self.source.snapshot()['last_result'], 'SUCCESS')
+        self.append(path, self.lifecycle('turn_aborted', turn='next'))
+        self.assertEqual(self.source.snapshot()['state'], 'SLEEP')
+        self.assertEqual(self.source.snapshot()['last_result'], 'SUCCESS')
 
 
 if __name__ == '__main__':

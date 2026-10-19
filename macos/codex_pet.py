@@ -22,8 +22,8 @@ def main(argv=None):
     commands.add_parser('setup', help='Pair this Mac and Wi-Fi over USB', add_help=False)
     commands.add_parser('status', help='Read the running local bridge')
     state = commands.add_parser('state', help='Set local pet state (explicit integration/fallback)')
-    state.add_argument('value', choices=STATES)
-    state.add_argument('--ttl', type=int, default=900, help='Seconds until SLEEP (1–86400; default 900)')
+    state.add_argument('value', type=str.upper, choices=STATES)
+    state.add_argument('--ttl', type=int, default=900, help='Seconds until automatic state resumes (1–86400; default 900)')
     commands.add_parser('bridge', help='Run bridge (normally managed by launchd)')
     # Pass setup arguments, including --help, unchanged to the original helper.
     arguments = list(sys.argv[1:] if argv is None else argv)
@@ -44,7 +44,7 @@ def main(argv=None):
         if args.value in ('SUCCESS', 'FAILED'):
             last = args.value
         atomic_json(support / 'state.json', dict(state=args.value, last_result=last,
-                                               expires_at=time.time() + args.ttl))
+                                               updated_at=time.time(), expires_at=time.time() + args.ttl))
     elif args.command == 'bridge':
         publish_identity(support)
         source = LocalSource(support, Path(os.environ.get('CODEX_HOME', str(Path.home() / '.codex'))))

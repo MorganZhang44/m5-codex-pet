@@ -1,9 +1,9 @@
-# M5StickS3 Codex Pet v0.6b phase 1 — macOS package
+# M5StickS3 Codex Pet v0.6b phase 2 — macOS package
 
 PlatformIO/Arduino firmware using M5Unified. The StickS3 passively reflects the
-Mac Codex Pet bridge. The firmware remains v0.6a; v0.6b phase 1 adds host packaging.
-Pet expressions and real usage bars keep their
-v0.4 meaning; Wi-Fi and HTTP failures never become `PetState::FAILED`.
+Mac Codex Pet bridge. The firmware remains v0.6a; v0.6b adds host packaging and
+local automatic lifecycle detection. Pet expressions and real usage bars keep
+their v0.4 meaning; Wi-Fi and HTTP failures never become `PetState::FAILED`.
 
 ## USB setup (default)
 
@@ -146,6 +146,13 @@ The standalone macOS package supplies `/status` on **0.0.0.0:8788**. It uses
 only the Python standard library at runtime; pyserial is needed only by USB setup.
 It has no runtime dependency on MCP, ChatGPT, a tunnel, an agent-loop server, or
 any other repository. See [macOS installation and smoke tests](docs/macos-package.md).
+The bridge reads standard local Codex session JSONL: `task_started` → RUNNING,
+`task_complete` → SUCCESS (FAILED only with a structured terminal error), and
+`turn_aborted` → SLEEP. Completion displays last 30 seconds; silent activity expires
+after 15 minutes. This also covers VS Code extension sessions that write those
+records locally. `codex-pet state running|success|failed|sleep` accepts any letter
+case and provides a TTL override. See the package guide for exact signals, scan
+bounds, precedence and failure-detection limitations.
 Stop any old status server using port 8788 before installing; the installer refuses
 a fresh installation when the port is already occupied. No other service is stopped.
 

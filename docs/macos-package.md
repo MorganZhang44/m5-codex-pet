@@ -1,9 +1,9 @@
-# macOS package: v0.6b phase 1
+# macOS package: v0.6b phase 2
 
 The source installer copies three Python modules plus a private Python environment.
 `codex-pet setup` dispatches to the byte-for-byte existing USB helper. `codex-pet
 bridge` runs a standard-library HTTP service under launchd. The bridge reads local
-Codex usage events and a package-owned local state file; no agent-loop/MCP/ChatGPT
+Codex usage/lifecycle events and a package-owned local state file; no agent-loop/MCP/ChatGPT
 process, checkout, tunnel, API token, Keychain access or cloud request is involved.
 Firmware, pairing protocol, UI, NVS behavior and dependencies remain v0.6a.
 
@@ -37,24 +37,79 @@ write routes, and no MCP dependency. `codex-pet status` reads localhost without
 requiring the repository. The LAN status endpoint has no authentication/TLS and
 exposes only the eight display fields; deploy on a trusted local network.
 
-**Task state:** no independent, authoritative Codex task lifecycle integration is
-available in this phase. The bridge does not infer success/failure from transcript
-text, process names, file activity or network errors. With no valid local state it
-returns `SLEEP` and `last_result: null`. An optional explicit local integration is:
+**Automatic task state:** the reader uses only timestamped JSONL `type: event_msg`
+records in the standard local session directory. It does not infer state from
+transcript text, process names, file modification times or network errors.
+
+| Signal (`payload.type`) | Display behavior |
+| --- | --- |
+| `task_started` | RUNNING; remember the active turn within that session |
+| `task_complete`, absent/null `payload.error` | SUCCESS for 30 seconds; record last_result SUCCESS |
+| `task_complete`, structured `payload.error` object with string `message` | FAILED for 30 seconds; record last_result FAILED |
+| `task_complete` with malformed non-null error | SLEEP, without recording a result |
+| `turn_aborted` | SLEEP, without recording a result (cancellation is not failure) |
+| No active turn or recent completion | SLEEP |
+
+A terminal event closes only its matching `turn_id` when both records supply IDs;
+older records without IDs are matched within their session. Any active session
+wins over another session's completion. Structured `event_msg` progress renews an
+already observed RUNNING turn; it cannot start one. After 15 minutes without such
+an event, RUNNING expires to SLEEP, never FAILED. This is an inactivity safety
+lease, not proof that a process stopped: long silent tools, approval waits, crashes,
+missing terminal records, or delayed log flushes cannot be distinguished exactly.
+State becomes visible on the next `/status` poll after Codex flushes its log, with
+a scan interval of two seconds (plus the device's polling delay).
+
+SUCCESS means a normal turn completion was recorded, not that every tool/test or
+the user's objective succeeded. Only the structured terminal error on
+`task_complete` supplies automatic FAILED. It is defined in the current upstream
+[Codex protocol source](https://github.com/openai/codex/blob/main/codex-rs/protocol/src/protocol.rs)
+(`TurnCompleteEvent.error`); not all installed versions write it. Standalone
+`error`, `stream_error`, failed commands/patches, and message wording do not set
+FAILED, because they can be recoverable or unrelated to terminal task status.
+Older writers may end without a terminal record (lease then SLEEP), or write a
+completion without failure details (displayed as completion/SUCCESS). Exact FAILED
+detection is therefore unavailable for those writers; use an explicit integration
+when an authoritative task outcome is required. The boundary names are documented
+in the upstream [Codex protocol](https://github.com/openai/codex/blob/main/codex-rs/docs/protocol_v1.md).
+
+**Local investigation on this Mac (2026-10-19):** metadata-only inspection found
+seven `codex_vscode` sessions (`source: vscode`, versions `0.131.0-alpha.9` and
+`0.140.0-alpha.2`) in `~/.codex/sessions`, in addition to `codex_exec` and Codex
+Desktop sessions. One representative log per VS Code version contained paired
+`task_started`/`task_complete` records (23/23 and 12/12 respectively). The 40 most
+recent exec logs had 40 starts and 37 completions at inspection time. This confirms
+local extension support here; it does not certify every extension release or
+failure path. No structured terminal failure was validated locally; that path is covered by synthetic tests.
+
+CLI, exec and VS Code use the same reader when they persist these standard local
+records; the reader does not filter on originator or require a running CLI.
+Remote/SSH/WSL/container/cloud sessions are visible only if their standard logs
+are available in the configured local session directory. Ephemeral sessions,
+versions that do not persist boundary events, and alternate app storage are not
+covered. No extension settings, private databases, credentials or unrelated user
+files are read, and no hooks are installed.
+
+**Explicit override/fallback:** case-insensitive input is normalized before
+validation; storage and the eight-field response remain uppercase.
 
 ```sh
-codex-pet state RUNNING                 # default expiry: 900 seconds
-codex-pet state SUCCESS --ttl 30        # also records last_result SUCCESS
-codex-pet state FAILED --ttl 30         # also records last_result FAILED
-codex-pet state SLEEP                  # preserves independent last_result
+codex-pet state running                 # default expiry: 900 seconds
+codex-pet state success --ttl 30        # also records last_result SUCCESS
+codex-pet state failed --ttl 30         # also records last_result FAILED
+codex-pet state sleep                  # preserves independent last_result
 ```
 
-Each write atomically replaces `state.json`. TTL must be 1–86400 seconds. On expiry,
-the current expression becomes SLEEP; the last explicit result persists across
-restarts until overwritten. RUNNING/SLEEP never manufacture a result. Malformed or
-missing state falls back to SLEEP/null. Use one state writer; simultaneous writers
-have last-write-wins behavior. For long tasks, refresh RUNNING before its TTL.
-There is no automatic Codex hook installation or automatic task history.
+Each write atomically replaces `state.json`. TTL must be 1–86400 seconds. A valid
+explicit state takes priority until expiry, including SLEEP; automatic observation
+continues underneath. On expiry, automatic state resumes (SLEEP if unavailable).
+RUNNING/SLEEP never manufacture a result. Explicit history persists across bridge
+restarts; automatic history is cached in memory and reconstructed from the bounded
+logs on restart. Outside an active override, the newer automatic result wins over
+an explicit record's `updated_at`; old phase-1 files without that timestamp yield
+to an available automatic result. Missing/malformed state files allow automatic
+state; with neither source, the response is SLEEP/null. Use one explicit state
+writer; simultaneous explicit writes have last-write-wins behavior.
 
 **Usage:** best-effort, read-only rate-limit observations in
 `~/.codex/sessions/**/*.jsonl`. A foreground `codex-pet bridge` honors `CODEX_HOME`;
@@ -67,10 +122,18 @@ The reader recognizes JSONL `type: event_msg`, `payload.type: token_count`,
 `payload.rate_limits.primary/secondary` objects with `window_minutes` of 300/10080,
 `used_percent` of 0–100, and Unix-seconds `resets_at`. The event's ISO timestamp
 is the observation time. Resets are converted to UTC, missing resets become null.
-It does not compute quota percentages from token counts. It scans at most every
-30 seconds, enumerates session paths and reads only the last 256 KiB of the 20
-most recently modified session files. It selects the newest supported observation
-across them. Unsupported versions/windows, older logs outside that bound, remote
+It does not compute quota percentages from token counts. The shared usage/lifecycle
+reader scans on demand at most every two seconds,
+enumerates session paths, and watches the 20 most recently modified JSONL files.
+It initially reads only the last 256 KiB per file, then reads appended complete
+lines using in-memory offsets (at most 256 KiB per file per scan). Partial final
+lines are retried. Symlinked session files/directories are skipped. File replacement,
+truncation or an append gap larger than 256 KiB resets that file to its bounded
+tail and clears its active turn. Evicted files also lose their active turn.
+A start outside the initial/reset tail cannot establish RUNNING, even if progress
+is present; this conservative limit also applies after a bridge restart. Records
+more than 60 seconds in the future are ignored. For usage it selects the newest
+supported observation across these files. Unsupported versions/windows, older logs outside that bound, remote
 sessions, archived sessions, missing rate-limit records, and Codex app storage
 outside that directory are unavailable. No auth/config/credential files or session
 text are exposed in the response, and no Codex API is polled.
@@ -79,7 +142,8 @@ With no observation: both percentages/resets/observation are null and
 `usage_stale` is true. Observations older than 10 minutes are stale; values remain
 visible. Cached usage survives transient read failures within the running process,
 but is reconstructed from logs after restart. It is an observation, not a live
-account quota or per-task consumption meter. Usage events never change task state.
+account quota or per-task consumption meter. Usage events cannot start or finish
+a turn, but can renew the inactivity lease of an already observed active turn.
 
 ## Install, remove and recovery
 
@@ -131,7 +195,7 @@ device's current pairing. Automated tests do neither.
 
    Expect the package Python process on `*:8788`, the current
    `scutil --get LocalHostName` plus `.local:8788` in the public file, and eight
-   fields with SLEEP/null history unless previously set. Usage may be null/stale.
+   fields with automatic state/history, or SLEEP/null when unavailable. Usage may be null/stale.
    If bootstrap succeeds before the bridge is ready, retry curl after a second.
    If needed inspect `tail -50 "$HOME/Library/Application Support/Codex Pet/bridge-error.log"`.
 
@@ -140,7 +204,7 @@ device's current pairing. Automated tests do neither.
    ```sh
    codex-pet state RUNNING --ttl 10
    codex-pet status
-   # Wait at least 10 seconds, then expect SLEEP.
+   # Wait at least 10 seconds, then expect automatic state (SLEEP if idle).
    codex-pet status
    codex-pet state SUCCESS --ttl 30
    codex-pet state SLEEP
@@ -150,9 +214,14 @@ device's current pairing. Automated tests do neither.
    ```
 
    Expect SLEEP with last_result SUCCESS after restart. Run a normal local Codex
-   session; if it emits the supported rate-limit event, usage should appear within
-   30 seconds. Otherwise null/stale is the expected fallback. No private-file
-   inspection or credentials are needed for this test.
+   turn in CLI and then VS Code; observe RUNNING while it works, SUCCESS for
+   30 seconds after completion, then SLEEP. Cancel another turn and expect SLEEP
+   without a new result. Before these automatic checks, run
+   `codex-pet state sleep --ttl 1` and wait at least one second to expire the override.
+   If the writer
+   emits supported rate-limit events, usage should appear within two seconds of
+   a flushed record and status poll. Otherwise null/stale is the expected fallback.
+   No private-file inspection or credentials are needed for this test.
 
 3. Verify LAN/mDNS before pairing. From another device on the same reachable LAN,
    request `http://<endpoint-from-identity-file>/status`. Allow the package Python
@@ -204,6 +273,8 @@ Run the host checks listed in the root README, `python3 tests/package_test.py`,
 homes, fake dependency provisioning/scutil/launchctl, and real HTTP parsing over
 in-memory connections. They cover layout, quoting, repeated install/removal,
 ownership/collision/symlink guards, stop failure, launchd generation/dispatch,
-unchanged helper/CLI dispatch, state expiry/history, local usage/schema/fallbacks,
+unchanged helper/CLI dispatch, case normalization, override expiry/history, turn boundaries/concurrency,
+partial appends, bounded reading, restart recovery, cancellation/terminal errors,
+inactivity expiry, local usage/schema/fallbacks,
 and absence of HTTP mutation routes. They do not exercise real launchd, firewall,
 pip networking, mDNS, USB or a LAN listener.
