@@ -1,7 +1,8 @@
-# M5StickS3 Codex status pet v0.6a — USB configuration
+# M5StickS3 Codex Pet v0.6b phase 1 — macOS package
 
 PlatformIO/Arduino firmware using M5Unified. The StickS3 passively reflects the
-Mac agent-loop Codex Pet bridge. Pet expressions and real usage bars keep their
+Mac Codex Pet bridge. The firmware remains v0.6a; v0.6b phase 1 adds host packaging.
+Pet expressions and real usage bars keep their
 v0.4 meaning; Wi-Fi and HTTP failures never become `PetState::FAILED`.
 
 ## USB setup (default)
@@ -11,13 +12,17 @@ v0.4 meaning; Wi-Fi and HTTP failures never become `PetState::FAILED`.
    Wi-Fi or optional compiled fallback it shows **USB SETUP** automatically.
    Otherwise hold **BtnB** (side button) for about **2 seconds** from PET or DEVICE.
    The same hold works at boot; release early to cancel. BtnA remains the page toggle.
-3. Close PlatformIO/other serial monitors, then from the repository root run:
+3. Install the macOS package below, close PlatformIO/other serial monitors, then
+   from any directory run:
 
    ```sh
-   python3 -m venv /tmp/codex-pet-setup-venv
-   /tmp/codex-pet-setup-venv/bin/python -m pip install pyserial
-   /tmp/codex-pet-setup-venv/bin/python scripts/codex_pet_setup.py
+   codex-pet setup
    ```
+
+   `codex-pet setup --port /dev/cu.usbmodem...` selects an explicit device. The
+   installed CLI invokes the existing helper unchanged, using its own environment.
+   The standalone `scripts/codex_pet_setup.py` entry point remains supported for
+   development/other OSes with Python 3 and pyserial installed.
 
    The helper discovers common USB serial devices; if several exist it asks which
    one. Override with `--port /dev/cu.usbmodem...`, `/dev/ttyACM0`, or `COM3`.
@@ -133,62 +138,65 @@ in **...** within the screen width. Unsupported non-ASCII/control bytes display
 as **?** in the built-in font, without wrapping or interpreting control text.
 The existing DEVICE layout stays unchanged; full bridge identifiers are shown in
 serial STATUS to avoid squeezing another row onto the portrait display. There is
-no Wi-Fi SSID scanning, OTA, installer, or new animation.
+no Wi-Fi SSID scanning, OTA, or new firmware animation.
 
 ## Current computer bridge identity
 
-Run the existing Mac status-service project (containing `status_server.py` and
-its `.venv-mcp` environment), for example:
+The standalone macOS package supplies `/status` on **0.0.0.0:8788**. It uses
+only the Python standard library at runtime; pyserial is needed only by USB setup.
+It has no runtime dependency on MCP, ChatGPT, a tunnel, an agent-loop server, or
+any other repository. See [macOS installation and smoke tests](docs/macos-package.md).
+Stop any old status server using port 8788 before installing; the installer refuses
+a fresh installation when the port is already occupied. No other service is stopped.
+
+### Install and pair on macOS
+
+Requires macOS, an interactive logged-in user, Python **3.9+** with `venv`/pip
+(e.g. this Mac's `/usr/bin/python3` from Command Line Tools), and internet access
+at installation to fetch **pyserial 3.5** from the configured pip index. No sudo.
+From this checkout:
 
 ```sh
-.venv-mcp/bin/python status_server.py --host 0.0.0.0
+./install_mac.sh
+export PATH="$HOME/.local/bin:$PATH"
+codex-pet status
+codex-pet setup
 ```
 
-The bridge must serve `/status` on a LAN-accessible listener, normally port 8788.
-It is supplied by the separate Mac agent-loop project; this repository does not
-install or change it. Allow it through the Mac firewall. Both devices must be on
-a reachable local network; guest client isolation, VLAN boundaries, or blocked
-multicast may prevent `.local` resolution/HTTP. IPv6-only endpoints are unsupported.
+Add the PATH line to your shell configuration once for future terminals. Re-running
+the installer updates only this package's owned targets and restarts its LaunchAgent.
+Keep the Python installation used to install the package: its private venv references
+that interpreter. The installed bridge/setup work without the checkout or `/tmp`.
+This phase is a source installer, not a bundled Python executable or signed `.pkg`.
 
-### Host helper detection and future installer contract
-
-The helper reads only a dedicated **public identity file**, by default
-`~/Library/Application Support/Codex Pet/bridge-identity.json`, or an explicit
-`--identity-file PATH`. The future bridge installer should maintain this file:
+The package writes the helper's public identity file at
+`~/Library/Application Support/Codex Pet/bridge-identity.json`:
 
 ```json
 {"endpoint":"my-mac.local:8788"}
 ```
 
-Publish the actual local computer's stable, LAN-resolvable hostname and actual
-listener port; prefer `.local` over DHCP IPv4. On macOS, an address-only package
-endpoint is upgraded to the current `LocalHostName.local` with the same port when
-that hostname is available. Update the file when hostname/port
-changes, and never put passwords, tokens, or other credentials in it. The helper
-validates the endpoint and bounds file size; it does not inspect general bridge
-configuration or private credential files. The current separate bridge project
-has not been changed to publish this contract. A package could instead provide a
-public local identity API in future; the helper currently implements the file
-contract only.
+It obtains the stable name from `scutil --get LocalHostName`, validates it, and
+refreshes this file at installation and bridge start. macOS mDNSResponder advertises
+that Mac's `.local` hostname; no separate Bonjour browsing/service instance is
+required because the firmware resolves the exact configured host. A hostname change
+requires restarting the bridge and pairing again; DHCP address changes do not.
+The public file registers the endpoint for USB setup; it contains no secrets and
+is not an authenticated device identity. The bridge is an unauthenticated, read-only
+LAN endpoint: use a trusted LAN and allow the Python listener through the macOS
+firewall if prompted. Both devices need IPv4 reachability; guest isolation, VLANs,
+firewall rules or blocked multicast can prevent `.local` resolution/HTTP.
 
-Without the file, macOS `scutil --get LocalHostName` supplies `hostname.local`,
-assuming the standard port 8788. `scutil --get ComputerName` supplies the displayed
-computer name. This fallback identifies the current Mac but **does not verify**
-that the bridge is installed, listening, or reachable from the Pet. Nonstandard
-ports should come from the package file. `--bridge hostname:port` is an explicit
-diagnostic override, with no interactive hostname entry in normal setup. On other
-OSes an identity file or diagnostic override is required; `.local` advertisement
-must be supplied by that computer's mDNS service.
+The helper reads only this dedicated file (or `--identity-file PATH`), bounds its
+size and validates its endpoint. Without it, macOS's `LocalHostName.local:8788`
+remains the development fallback. `--bridge host:port` remains a diagnostic override.
+Detection identifies the Mac; it does not prove the service is reachable from Pet.
+No general bridge config or private credential files are inspected.
 
-On macOS, the helper finds Wi-Fi interfaces with `networksetup
--listallhardwareports` and asks `-getairportnetwork` for the associated SSID. It
-never scans saved networks or reads Keychain/stored passwords. macOS versions,
-Location Services/privacy restrictions, command output changes, or no active
-Wi-Fi may prevent detection; it then asks for the current SSID. Verify the shown
-SSID before confirming, including that the network supports the Pet's 2.4 GHz
-radio. Detection does not establish band compatibility or end-to-end reachability.
-SSID and password whitespace/UTF-8 bytes are preserved. There is no browser/AP
-provisioning or permission-changing workaround.
+On macOS, the helper queries public `networksetup -listallhardwareports` and
+`-getairportnetwork` output for the current Wi-Fi SSID. Privacy restrictions or no
+active Wi-Fi can prevent detection; it then asks for the current **2.4 GHz** SSID.
+It never scans saved networks, reads Keychain or retrieves stored passwords.
 
 ### Runtime endpoint policy
 
@@ -343,6 +351,7 @@ c++ -std=c++11 -Wall -Wextra -pedantic -Isrc tests/bridge_selection_test.cpp -o 
 /tmp/pet-bridge-test
 python3 tests/run_wifi_config_test.py
 python3 tests/setup_helper_test.py
+python3 tests/package_test.py
 git diff --check
 ```
 
@@ -386,7 +395,10 @@ pet/usage updates appear on return, and setup stays dedicated from either page.
 - `wifi_credentials.h`: portable validation, stable storage layout, source choice.
 - `wifi_config.cpp`: USB serial adapter, Wi-Fi Preferences storage, legacy config.
 - `serial_setup.h`: bounded portable serial parser, staging and save/reboot protocol.
-- `scripts/codex_pet_setup.py`: interactive USB host setup helper.
+- `scripts/codex_pet_setup.py`: unchanged interactive USB host setup helper.
+- `macos/bridge.py`: independent local usage/state source and eight-field HTTP service.
+- `macos/codex_pet.py`: installed setup/status/state CLI and bridge entry point.
+- `macos/install.py`, `install_mac.sh`, `uninstall_mac.sh`: owned per-user layout/launchd lifecycle.
 - `bridge_selection.h`: portable endpoint validation and exact matching policy.
 - `bridge_config.cpp`: current endpoint loading and exact-host mDNS resolution.
 - `pairing_config.h`: single atomic Wi-Fi + bridge record layout.
