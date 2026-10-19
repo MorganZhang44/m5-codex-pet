@@ -198,12 +198,28 @@ void PetUi::showSetup() {
   navigation.enterSetup();
   auto& lcd = M5.Display;
   lcd.fillScreen(kBackground);
+  lcd.setTextFont(1);
+  lcd.setTextSize(2);
   lcd.setTextColor(TFT_YELLOW, kBackground);
-  lcd.setCursor(4, 12);
-  lcd.print("USB SETUP");
+  lcd.drawCenterString("USB SETUP", lcd.width() / 2, 10);
+  lcd.setTextSize(1);
+
+  lcd.drawString("1 FIRST TIME", 8, 42);
   lcd.setTextColor(TFT_WHITE, kBackground);
-  lcd.setCursor(4, 40);
-  lcd.print("Connect USB\nRun on computer:\npython3 scripts/\ncodex_pet_setup.py\n\nOr serial 115200\nType HELP\nSave then reboot");
+  // Font 1 uses 6x8 cells. Wrap the URL and installer path, with extra space between
+  // commands so the clone/install flow remains readable on 135x240.
+  lcd.drawString("git clone", 8, 64);
+  lcd.drawString("https://github.com/", 14, 78);
+  lcd.drawString("MorganZhang44/", 14, 90);
+  lcd.drawString("m5-codex-pet.git", 14, 102);
+  lcd.drawString("./m5-codex-pet/", 8, 126);
+  lcd.drawString("install_mac.sh", 8, 138);
+
+  lcd.drawFastHLine(8, 170, lcd.width() - 16, kMuted);
+  lcd.setTextColor(TFT_YELLOW, kBackground);
+  lcd.drawString("2 SETUP", 8, 184);
+  lcd.setTextColor(TFT_WHITE, kBackground);
+  lcd.drawString("codex-pet setup", 8, 208);
 }
 
 void PetUi::setUsage(const Usage& usage) {

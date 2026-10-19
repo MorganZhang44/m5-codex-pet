@@ -69,6 +69,36 @@ int main() {
     assert(shown(device ? "DEVICE" : "SUCCESS"));
     PetUi::showSetup();
     assert(shown("USB SETUP"));
+    const std::vector<std::string> expected = {
+        "USB SETUP", "1 FIRST TIME", "git clone", "https://github.com/",
+        "MorganZhang44/", "m5-codex-pet.git", "./m5-codex-pet/",
+        "install_mac.sh", "2 SETUP", "codex-pet setup"};
+    assert(M5.Display.text == expected);
+    // Check the renderer's actual positions and font sizes on 135x240,
+    // including the larger title. Every row has breathing room and no wrap.
+    int previousBottom = 0;
+    for (const auto& row : M5.Display.textDraws) {
+      assert(row.font == 1 && row.size >= 1);
+      assert(row.value.find_first_of("\\\n") == std::string::npos);
+      assert(row.value.find("PATH") == std::string::npos);
+      assert(row.value.find("export") == std::string::npos);
+      assert(row.x >= 0);
+      assert(row.x + row.value.size() * 6 * row.size <=
+             static_cast<size_t>(M5.Display.width()));
+      assert(row.y >= previousBottom + 4);
+      previousBottom = row.y + 8 * row.size;
+      assert(previousBottom <= M5.Display.height() - 8);
+    }
+    // The two numbered sections are separated from their content and each
+    // other; SETUP has exactly one line beneath it, the setup command.
+    const auto& rows = M5.Display.textDraws;
+    assert(rows.size() == expected.size());
+    assert(rows[6].value + rows[7].value == "./m5-codex-pet/install_mac.sh");
+    assert(rows[6].x == rows[7].x && rows[7].y == rows[6].y + 12);
+    assert(rows[2].y - (rows[1].y + 8 * rows[1].size) >= 12);
+    assert(rows[8].y - (rows[7].y + 8 * rows[7].size) >= 24);
+    assert(rows[9].y - (rows[8].y + 8 * rows[8].size) >= 12);
+    assert(M5.Display.size == 1); // Later screens keep their normal font size.
     const auto draws = M5.Display.draws;
     click(6000);
     PetUi::setTransport(TransportState::SETUP);

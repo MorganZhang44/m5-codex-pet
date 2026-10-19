@@ -153,8 +153,12 @@ after 15 minutes. This also covers VS Code extension sessions that write those
 records locally. `codex-pet state running|success|failed|sleep` accepts any letter
 case and provides a TTL override. See the package guide for exact signals, scan
 bounds, precedence and failure-detection limitations.
-Stop any old status server using port 8788 before installing; the installer refuses
-a fresh installation when the port is already occupied. No other service is stopped.
+If port 8788 belongs to the current user's positively identified legacy
+`org.codex-pet.status` LaunchAgent running `~/agent-loop/status_server.py`, the
+installer disables and boots out that job, verifies the port is free, then
+continues. Unrelated or ambiguous listeners are refused without stopping them.
+The legacy files remain intact; uninstall does not re-enable the old service.
+See the package guide for identification requirements and recovery.
 
 ### Install and pair on macOS
 
@@ -165,13 +169,17 @@ From this checkout:
 
 ```sh
 ./install_mac.sh
-export PATH="$HOME/.local/bin:$PATH"
+# Open a new Terminal window/tab, then:
 codex-pet status
 codex-pet setup
 ```
 
-Add the PATH line to your shell configuration once for future terminals. Re-running
-the installer updates only this package's owned targets and restarts its LaunchAgent.
+The installer appends one guarded PATH block to `~/.zshrc` (or the `.zshrc` in an
+exported, absolute `ZDOTDIR`), preserving existing content. Future interactive zsh
+sessions include `~/.local/bin` without duplicate PATH entries on repeated installs.
+The already-open Terminal keeps its current PATH; to pair immediately there, run
+`"$HOME/.local/bin/codex-pet" setup`. Other shells need their own PATH configuration.
+Re-running the installer updates this package's owned targets and restarts its LaunchAgent.
 Keep the Python installation used to install the package: its private venv references
 that interpreter. The installed bridge/setup work without the checkout or `/tmp`.
 This phase is a source installer, not a bundled Python executable or signed `.pkg`.

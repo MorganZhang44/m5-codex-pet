@@ -152,24 +152,72 @@ Python 3.9+ with venv/pip and installation-time access to pyserial 3.5 are requi
 The resulting venv still depends on that base Python installation. This is a source
 package, not a signed installer with an embedded Python distribution.
 
+Installation appends one marked, guarded PATH block to `~/.zshrc`, or to
+`$ZDOTDIR/.zshrc` if an absolute `ZDOTDIR` is exported to the installer. The block
+adds `$HOME/.local/bin` only when it is absent from PATH. Repeated installs leave
+the same block in place; existing shell configuration bytes and permissions are
+preserved. Symlinked/non-regular rc targets and partially edited package blocks
+are refused before service migration. No other shell startup files are edited.
+Relative `ZDOTDIR` is refused; a `ZDOTDIR` set only inside shell startup files and
+not exported cannot be detected by the installer. Other shells, disabled rc
+loading, and startup code that later replaces PATH require user configuration.
+
+Open a new Terminal window/tab after installation to use `codex-pet setup`
+directly in interactive zsh (login or non-login). The installer cannot change its
+parent Terminal's environment. For immediate use in the already-open Terminal,
+run `"$HOME/.local/bin/codex-pet" setup`; no manual export is needed in new sessions.
+
 The installer rejects unowned target collisions and symlinked target paths. It
-leaves other LaunchAgents alone. It stops only its owned launchd label on update,
+stops its owned launchd label on update,
 and marks ownership before dependency provisioning so an interrupted install is
 retryable. If provisioning/bootstrap fails, correct the reported problem and
 rerun the installer; there is no transactional rollback to an earlier runtime.
-An occupied port is rejected before a first install. After install, inspect
+Before a fresh install writes package files, it tests TCP 8788. If occupied, the
+only automatic migration is the current user's `gui/<uid>/org.codex-pet.status`
+LaunchAgent. Its launchd PID must match the sole listening PID reported by lsof,
+and ps must report the current UID and a Python command running exactly
+`~/agent-loop/status_server.py --host 0.0.0.0 --port 8788` (optionally followed by
+`--bonjour`). The listener PID, job PID, UID and full command must remain identical
+across two checks immediately before mutation; a restarting or changing job is refused.
+Missing metadata, a different label/path/command, multiple listening PIDs, another
+user or an ambiguous command fails closed with a diagnostic. Resolve those
+conflicts manually; the installer never kills a PID or unloads arbitrary jobs.
+
+For a confirmed legacy listener, the installer first runs `launchctl disable` for
+that exact service target, then `launchctl bootout`. This stops KeepAlive and
+prevents the retained legacy plist from loading again at login. It waits up to
+five seconds for a successful IPv4 bind on 8788 before continuing. Disable/bootout
+failure or a port that remains occupied aborts installation without provisioning
+the new runtime. Upgrades also check the port after stopping the owned bridge;
+retrying an interrupted migration or reinstalling with a free port is safe.
+Inspection reads only launchd/listener/process metadata, never legacy source,
+credentials or configuration files; the installed runtime remains independent of
+agent-loop and MCP. The legacy plist and checkout are neither removed nor edited.
+
+After a partial migration, the old job may already be disabled. Correct the
+reported conflict and rerun the installer. There is no automatic legacy rollback.
+If deliberately restoring the old service, uninstall the new package and verify
+8788 is free first, then use `launchctl enable "gui/$(id -u)/org.codex-pet.status"`
+and bootstrap its retained, verified plist in that GUI domain. Do not run both
+bridges on 8788.
+
+After install, inspect
 `bridge-error.log` if launchd cannot bind (for example, a competing server starts).
 
 `./uninstall_mac.sh` stops only `com.codex-pet.bridge`, removes only the owned CLI,
 LaunchAgent, runtime subtree and public identity, and retains state/logs/ownership
 marker and unrelated files. An absent install is a no-op; a replaced CLI/plist is
-left intact with an error. No shell rc, firewall settings, Python installation,
-Codex logs/credentials, other services or device NVS are changed. Reinstall is
+left intact with an error. Uninstall retains the PATH block and leaves shell rc,
+firewall settings, Python installation, Codex logs/credentials, unrelated services
+and device NVS unchanged. Reinstall is
 supported. Remove the retained state/logs manually if desired. The uninstall script
 uses host Python and does not require a functioning package venv.
+Uninstall never re-enables or deletes the migrated legacy service; it stays
+disabled, including across login, until explicitly restored.
 
 For development, `--no-launchd --home /absolute/staging/home` stages files under
-that home without launchctl. It still validates the Mac hostname and provisions
+that home without launchctl (including that home's `.zshrc`, ignoring the real
+user's `ZDOTDIR`). It still validates the Mac hostname and provisions
 the real venv; it does not install a service for another user. Tests inject fake
 provisioning and launchctl and use temporary homes, not this flag on your home.
 
@@ -178,14 +226,14 @@ provisioning and launchctl and use temporary homes, not this flag on your home.
 These steps deliberately install/start the package and, at pairing, replace the
 device's current pairing. Automated tests do neither.
 
-1. Log in to the Mac desktop. Stop the old agent-loop status server if it owns
-   port 8788. Inspect before installing:
+1. Log in to the Mac desktop. Inspect before installing; a matching legacy
+   `org.codex-pet.status` listener is migrated automatically:
 
    ```sh
    cd /Users/morganmacmini/m5-codex-pet
    lsof -nP -iTCP:8788 -sTCP:LISTEN
    ./install_mac.sh
-   export PATH="$HOME/.local/bin:$PATH"
+   # Open a new Terminal window/tab before running the remaining commands.
    launchctl print "gui/$(id -u)/com.codex-pet.bridge"
    lsof -nP -iTCP:8788 -sTCP:LISTEN
    cat "$HOME/Library/Application Support/Codex Pet/bridge-identity.json"
@@ -198,6 +246,9 @@ device's current pairing. Automated tests do neither.
    fields with automatic state/history, or SLEEP/null when unavailable. Usage may be null/stale.
    If bootstrap succeeds before the bridge is ready, retry curl after a second.
    If needed inspect `tail -50 "$HOME/Library/Application Support/Codex Pet/bridge-error.log"`.
+   After migration, `launchctl print "gui/$(id -u)/org.codex-pet.status"` should
+   report no loaded job, and `launchctl print-disabled "gui/$(id -u)"` should list
+   `org.codex-pet.status` as disabled. Its original files should still exist.
 
 2. Verify launchd restart and state expiry:
 
@@ -272,7 +323,12 @@ Run the host checks listed in the root README, `python3 tests/package_test.py`,
 `git diff --check`, and `~/.platformio/penv/bin/pio run`. Package tests use temporary
 homes, fake dependency provisioning/scutil/launchctl, and real HTTP parsing over
 in-memory connections. They cover layout, quoting, repeated install/removal,
+append-only zsh configuration, real isolated login/non-login zsh startup and CLI
+discovery, PATH deduplication, exported ZDOTDIR and unsafe/edited rc refusal,
 ownership/collision/symlink guards, stop failure, launchd generation/dispatch,
+free-port installation, legacy PID/UID/command identification, successful migration
+and repeat install, disable/bootout failure, port-release timeout, unrelated or
+ambiguous listener refusal, owned upgrade with a competing listener,
 unchanged helper/CLI dispatch, case normalization, override expiry/history, turn boundaries/concurrency,
 partial appends, bounded reading, restart recovery, cancellation/terminal errors,
 inactivity expiry, local usage/schema/fallbacks,

@@ -1,10 +1,12 @@
 """Package tests: temporary homes, mocked launchd/pip/scutil, no privileged writes."""
 import contextlib
+import errno
 import io
 import json
 import os
 from pathlib import Path
 import plistlib
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -86,6 +88,260 @@ class PackageTest(unittest.TestCase):
             ctl.reset_mock()
             install.uninstall(self.home)
             self.assertEqual(ctl.call_args.args, ('bootout', 'gui/' + str(os.getuid()) + '/' + install.LABEL))
+
+    def test_zsh_path_append_repeat_and_uninstall_preserve_user_content(self):
+        self.home.mkdir(parents=True)
+        rc = self.home / '.zshrc'
+        original = b'# user settings\r\nexport MY_SETTING="keep"\n# no final newline'
+        rc.write_bytes(original)
+        rc.chmod(0o640)
+        profile = self.home / '.zprofile'
+        profile.write_bytes(b'# leave login settings alone\n')
+        self.install()
+        expected = original + b'\n' + install.ZSH_PATH_BLOCK
+        self.assertEqual(rc.read_bytes(), expected)
+        self.assertEqual(rc.stat().st_mode & 0o777, 0o640)
+        self.install()
+        self.assertEqual(rc.read_bytes(), expected)
+        install.uninstall(self.home, False)
+        self.assertEqual(rc.read_bytes(), expected)
+        self.assertEqual(profile.read_bytes(), b'# leave login settings alone\n')
+
+    def test_new_zsh_sessions_find_cli_and_do_not_duplicate_path(self):
+        self.install()
+        rc = self.home / '.zshrc'
+        self.assertEqual(rc.read_bytes(), install.ZSH_PATH_BLOCK)
+        for login in (False, True):
+            for existing in (False, True):
+                with self.subTest(login=login, existing=existing):
+                    local_bin = str(self.home / '.local/bin')
+                    path = '/usr/bin:/bin' + (':' + local_bin if existing else '')
+                    result = subprocess.run(
+                        ['/bin/zsh', '-d', *(['-l'] if login else []), '-i', '-c',
+                         'print -r -- "$PATH"; source "$ZDOTDIR/.zshrc"; print -r -- "$PATH"; '
+                         'command -v codex-pet; codex-pet setup --help'],
+                        env={'HOME': str(self.home), 'ZDOTDIR': str(self.home), 'PATH': path},
+                        capture_output=True, text=True)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    lines = result.stdout.splitlines()
+                    self.assertEqual(lines[0].split(':').count(local_bin), 1)
+                    self.assertEqual(lines[1], lines[0])
+                    self.assertEqual(lines[2], str(self.paths['cli']))
+                    self.assertIn('--identity-file', result.stdout)
+
+    def test_zdotdir_is_honored_and_unsafe_shell_targets_fail_before_migration(self):
+        custom = self.home / 'custom zsh'
+        with patch.object(install, 'publish_identity'), patch.object(install, 'launchctl'):
+            install.install(self.home, ROOT, False, fake_provision, zdotdir=str(custom))
+        self.assertFalse((self.home / '.zshrc').exists())
+        self.assertEqual((custom / '.zshrc').read_bytes(), install.ZSH_PATH_BLOCK)
+        for directory in (False, True):
+            with self.subTest(directory=directory):
+                unsafe = self.home / ('unsafe-dir' if directory else 'unsafe-file')
+                unsafe.mkdir()
+                target = unsafe / '.zshrc'
+                if directory:
+                    target.mkdir()
+                else:
+                    target.symlink_to(custom / '.zshrc')
+                with patch.object(install, 'ensure_bridge_port') as migrate, \
+                     patch.object(install, 'stop_service') as stop:
+                    with self.assertRaises(RuntimeError):
+                        install.install(self.home, ROOT, True, fake_provision, zdotdir=str(unsafe))
+                    migrate.assert_not_called()
+                    stop.assert_not_called()
+        with self.assertRaisesRegex(RuntimeError, 'ZDOTDIR must be absolute'):
+            install.zsh_path_update(self.home, 'relative')
+
+    def test_modified_path_block_is_not_overwritten(self):
+        self.home.mkdir(parents=True)
+        rc = self.home / '.zshrc'
+        original = b'# >>> codex-pet PATH >>>\n# user-edited block\n'
+        rc.write_bytes(original)
+        with self.assertRaisesRegex(RuntimeError, 'PATH block was modified'):
+            self.install()
+        self.assertEqual(rc.read_bytes(), original)
+        self.assertFalse(self.paths['support'].exists())
+
+    def test_port_probe_only_treats_address_in_use_as_conflict(self):
+        with patch.object(install.socket, 'socket') as socket:
+            bind = socket.return_value.__enter__.return_value.bind
+            self.assertTrue(install.port_free())
+            socket.return_value.__enter__.return_value.setsockopt.assert_called_once_with(
+                install.socket.SOL_SOCKET, install.socket.SO_REUSEADDR, 1)
+            bind.side_effect = OSError(errno.EADDRINUSE, 'busy')
+            self.assertFalse(install.port_free())
+            bind.side_effect = OSError(errno.EACCES, 'denied')
+            with self.assertRaises(OSError):
+                install.port_free()
+
+    def test_legacy_listener_requires_matching_job_pid_uid_and_command(self):
+        # Metadata only: neither the legacy plist nor checkout need exist.
+        target = 'gui/' + str(os.getuid()) + '/' + install.LEGACY_LABEL
+        command = ('/usr/bin/python3 ' + shlex.quote(str(self.home / 'agent-loop/status_server.py')) +
+                   ' --host 0.0.0.0 --port 8788 --bonjour')
+        def identify(pids='123\n', job_pid='123', uid=None, cmd=None, job_code=0,
+                     listener_code=0, process_code=0):
+            results = [subprocess.CompletedProcess([], listener_code, pids, ''),
+                       subprocess.CompletedProcess([], process_code,
+                           str(os.getuid() if uid is None else uid) + ' ' + (cmd or command), '')]
+            with patch.object(install.subprocess, 'run', side_effect=results) as run, \
+                 patch.object(install, 'launchctl', return_value=subprocess.CompletedProcess(
+                     [], job_code, '\tpid = ' + job_pid + '\n', '')) as ctl:
+                result = install.legacy_listener(self.home, target)
+                if result:
+                    ctl.assert_called_once_with('print', target, check=False)
+                    self.assertEqual(run.call_args_list[1].args[0][:4], ['/bin/ps', '-ww', '-p', '123'])
+                return result
+        self.assertTrue(identify())
+        self.assertTrue(identify(cmd=command.replace('/usr/bin/python3', '/Library/Python.framework/Python')))
+        self.assertTrue(identify(cmd=command.removesuffix(' --bonjour')))
+        self.assertFalse(identify(pids='123\n456\n'))
+        self.assertFalse(identify(pids=''))
+        self.assertFalse(identify(job_pid='456'))
+        self.assertFalse(identify(job_code=1))
+        self.assertFalse(identify(listener_code=1))
+        self.assertFalse(identify(process_code=1))
+        self.assertFalse(identify(pids='not-a-pid'))
+        self.assertFalse(identify(job_pid='123\n\tpid = 123'))
+        self.assertFalse(identify(uid=os.getuid() + 1))
+        for cmd in ('/usr/bin/python3 /other/status_server.py --port 8788',
+                    command + ' --unknown', command.replace('--port 8788', '--port 8789'),
+                    command.replace('python3', 'other'), 'malformed'):
+            self.assertFalse(identify(cmd=cmd))
+
+    def test_free_port_needs_no_legacy_inspection(self):
+        with patch.object(install, 'port_free', return_value=True), \
+             patch.object(install, 'legacy_listener') as identify, \
+             patch.object(install, 'launchctl') as ctl:
+            self.install(True)
+        identify.assert_not_called()
+        self.assertEqual([c.args[0] for c in ctl.call_args_list], ['enable', 'bootstrap'])
+
+    def test_legacy_migration_then_repeat_install(self):
+        with patch.object(install, 'port_free', side_effect=[False, False, True, True]), \
+             patch.object(install, 'legacy_listener', return_value=True) as identify, \
+             patch.object(install, 'launchctl') as ctl, patch.object(install.time, 'sleep'):
+            ctl.return_value.returncode = 0
+            self.install(True)
+            self.install(True)
+        target = 'gui/' + str(os.getuid()) + '/' + install.LEGACY_LABEL
+        self.assertEqual(identify.call_count, 2)
+        self.assertEqual([c.args for c in ctl.call_args_list], [
+            ('disable', target), ('bootout', target),
+            ('enable', 'gui/' + str(os.getuid()) + '/' + install.LABEL),
+            ('bootstrap', 'gui/' + str(os.getuid()), str(self.paths['plist'])),
+            ('bootout', 'gui/' + str(os.getuid()) + '/' + install.LABEL),
+            ('enable', 'gui/' + str(os.getuid()) + '/' + install.LABEL),
+            ('bootstrap', 'gui/' + str(os.getuid()), str(self.paths['plist']))])
+
+    def test_unrelated_ambiguous_or_changed_listener_refused_before_writes(self):
+        for evidence in ([False], [True, False], [('123',), ('456',)],
+                         [OSError('metadata unavailable')],
+                         [subprocess.TimeoutExpired('metadata lookup', 5)]):
+            with self.subTest(evidence=evidence), \
+                 patch.object(install, 'port_free', return_value=False), \
+                 patch.object(install, 'legacy_listener', side_effect=evidence), \
+                 patch.object(install, 'launchctl') as ctl:
+                with self.assertRaisesRegex(RuntimeError, 'could not positively identify'):
+                    self.install(True)
+                ctl.assert_not_called()
+                self.assertFalse(self.paths['support'].exists())
+
+    def test_install_migration_with_real_identification_and_retained_legacy_files(self):
+        # Exercise identification and install together, with only OS calls mocked.
+        legacy_plist = self.home / 'Library/LaunchAgents/org.codex-pet.status.plist'
+        legacy_plist.parent.mkdir(parents=True)
+        legacy_plist.write_bytes(b'legacy plist retained without inspection')
+        legacy_script = self.home / 'agent-loop/status_server.py'
+        legacy_script.parent.mkdir()
+        legacy_script.write_bytes(b'legacy checkout retained without inspection')
+        command = '/usr/bin/python3 ' + shlex.quote(str(legacy_script))
+        command += ' --host 0.0.0.0 --port 8788 --bonjour'
+        target = 'gui/' + str(os.getuid()) + '/' + install.LEGACY_LABEL
+        mutations = []
+
+        def run(args, **kwargs):
+            if args[0] == '/usr/sbin/lsof':
+                return subprocess.CompletedProcess(args, 0, '123\n', '')
+            if args[0] == '/bin/ps':
+                return subprocess.CompletedProcess(args, 0, str(os.getuid()) + ' ' + command, '')
+            self.assertEqual(args[0], '/bin/launchctl')
+            if args[1] == 'print':
+                self.assertEqual(args[2], target)
+                return subprocess.CompletedProcess(args, 0, '\tpid = 123\n', '')
+            mutations.append(args[1:])
+            return subprocess.CompletedProcess(args, 0, '', '')
+
+        with patch.object(install.subprocess, 'run', side_effect=run), \
+             patch.object(install, 'publish_identity'), \
+             patch.object(install, 'port_free', side_effect=[False, True]):
+            install.install(self.home, ROOT, True, fake_provision)
+        self.assertEqual(mutations[:2], [['disable', target], ['bootout', target]])
+        self.assertEqual([args[0] for args in mutations], ['disable', 'bootout', 'enable', 'bootstrap'])
+        self.assertTrue(self.paths['runtime'].exists())
+        # Removal must not restore or delete the migrated job.
+        with patch.object(install, 'launchctl') as ctl:
+            ctl.return_value.returncode = 0
+            install.uninstall(self.home)
+        self.assertEqual([call.args for call in ctl.call_args_list], [
+            ('bootout', 'gui/' + str(os.getuid()) + '/' + install.LABEL)])
+        self.assertEqual(legacy_plist.read_bytes(), b'legacy plist retained without inspection')
+        self.assertEqual(legacy_script.read_bytes(), b'legacy checkout retained without inspection')
+
+    def test_install_refuses_unrelated_process_even_with_legacy_job_label(self):
+        target = 'gui/' + str(os.getuid()) + '/' + install.LEGACY_LABEL
+        results = [subprocess.CompletedProcess([], 0, '123\n', ''),
+                   subprocess.CompletedProcess([], 0, '\tpid = 123\n', ''),
+                   subprocess.CompletedProcess([], 0,
+                       str(os.getuid()) + ' /usr/bin/python3 /other/server.py --port 8788', '')]
+        with patch.object(install, 'port_free', return_value=False), \
+             patch.object(install.subprocess, 'run', side_effect=results) as run:
+            with self.assertRaisesRegex(RuntimeError, 'No conflicting service was stopped'):
+                install.install(self.home, ROOT, True, Mock())
+        self.assertEqual(run.call_args_list[1].args[0], ['/bin/launchctl', 'print', target])
+        self.assertEqual(run.call_count, 3)
+        self.assertFalse(self.paths['support'].exists())
+
+    def test_legacy_disable_stop_failure_or_port_still_occupied(self):
+        for codes, expected, calls in (([1], 'Could not disable', ['disable']),
+                                       ([0, 1], 'Could not stop', ['disable', 'bootout']),
+                                       ([0, 0], 'remains occupied', ['disable', 'bootout'])):
+            with self.subTest(codes=codes), \
+                 patch.object(install, 'port_free', return_value=False), \
+                 patch.object(install, 'legacy_listener', return_value=True), \
+                 patch.object(install.time, 'sleep'), \
+                 patch.object(install, 'launchctl', side_effect=[
+                     subprocess.CompletedProcess([], code) for code in codes]) as ctl:
+                with self.assertRaisesRegex(RuntimeError, expected):
+                    self.install(True)
+                self.assertEqual([c.args[0] for c in ctl.call_args_list], calls)
+                self.assertFalse(self.paths['support'].exists())
+
+    def test_owned_upgrade_still_checks_port_after_stop(self):
+        self.install()
+        before = (self.paths['runtime'] / 'bridge.py').read_bytes()
+        with patch.object(install, 'port_free', return_value=False), \
+             patch.object(install, 'legacy_listener', return_value=False), \
+             patch.object(install.time, 'sleep'), \
+             patch.object(install, 'launchctl') as ctl:
+            ctl.return_value.returncode = 0
+            with self.assertRaisesRegex(RuntimeError, 'TCP 8788 is occupied'):
+                self.install(True)
+        self.assertEqual([c.args[0] for c in ctl.call_args_list], ['bootout'])
+        self.assertEqual((self.paths['runtime'] / 'bridge.py').read_bytes(), before)
+
+    def test_legacy_launchctl_errors_explain_partial_migration(self):
+        for results, message in (([OSError('unavailable')], 'may already be disabled'),
+                                 ([subprocess.CompletedProcess([], 0),
+                                   subprocess.TimeoutExpired('bootout', 5)], 'may still be running')):
+            with self.subTest(message=message), \
+                 patch.object(install, 'port_free', return_value=False), \
+                 patch.object(install, 'legacy_listener', return_value=('123',)), \
+                 patch.object(install, 'launchctl', side_effect=results):
+                with self.assertRaisesRegex(RuntimeError, message):
+                    self.install(True)
+                self.assertFalse(self.paths['support'].exists())
 
     def test_stop_failure_retains_runtime(self):
         self.install()
