@@ -6,7 +6,7 @@
 #include <cstring>
 #include "status_data.h"
 
-// Strict flat whitelist: all six fields exactly once, in any order. Parse into
+// Strict flat whitelist: all eight fields exactly once, in any order. Parse into
 // a temporary so invalid replies cannot partially update the caller's snapshot.
 namespace StatusParser {
 inline void skipSpace(const char*& p) {
@@ -49,32 +49,56 @@ inline bool number(const char*& p, double& value) {
   return end == p && errno != ERANGE && std::isfinite(value);
 }
 
-// Validate timestamp metadata without guessing its units/format or using a
-// device clock. The bridge's usage_stale boolean controls freshness.
+// Validate a JSON string fully, optionally retaining decoded ASCII for ISO parsing.
+// Non-ASCII/control characters cannot occur in a usable ISO reset timestamp.
+inline bool jsonString(const char*& p, char* output = nullptr, size_t capacity = 0) {
+  if (!consume(p, "\"")) return false;
+  size_t length = 0;
+  while (*p && *p != '"') {
+    unsigned char c = static_cast<unsigned char>(*p++);
+    if (c < 0x20) return false;
+    if (c == '\\') {
+      if (*p == 'u') {
+        ++p;
+        unsigned code = 0;
+        for (int i = 0; i < 4; ++i) {
+          const char hex = *p;
+          if (!digit(hex) && !(hex >= 'a' && hex <= 'f') &&
+              !(hex >= 'A' && hex <= 'F')) return false;
+          code = code * 16 + (digit(hex) ? hex - '0' :
+                             hex >= 'a' ? hex - 'a' + 10 : hex - 'A' + 10);
+          ++p;
+        }
+        c = code >= 0x20 && code < 0x7f ? static_cast<unsigned char>(code) : '?';
+      } else {
+        if (!*p || !std::strchr("\"\\/bfnrt", *p)) return false;
+        c = static_cast<unsigned char>(*p++);
+        if (std::strchr("bfnrt", c)) c = '?';
+      }
+    }
+    if (output && length + 1 < capacity) output[length] = static_cast<char>(c);
+    ++length;
+  }
+  if (!consume(p, "\"")) return false;
+  if (output && capacity) output[length < capacity ? length : 0] = '\0';
+  return true;
+}
+
+// The bridge's usage_stale boolean alone controls freshness.
 inline bool timestamp(const char*& p) {
   if (consume(p, "null")) return true;
-  if (!consume(p, "\"")) {
-    double ignored;
-    return number(p, ignored);
-  }
-  while (*p && *p != '"') {
-    const unsigned char c = static_cast<unsigned char>(*p++);
-    if (c < 0x20) return false;
-    if (c != '\\') continue;
-    if (*p == 'u') {
-      ++p;
-      for (int i = 0; i < 4; ++i) {
-        const char hex = *p;
-        if (!digit(hex) && !(hex >= 'a' && hex <= 'f') &&
-            !(hex >= 'A' && hex <= 'F')) return false;
-        ++p;
-      }
-    } else {
-      if (!*p || !std::strchr("\"\\/bfnrt", *p)) return false;
-      ++p;
-    }
-  }
-  return consume(p, "\"");
+  skipSpace(p);
+  if (*p == '"') return jsonString(p);
+  double ignored;
+  return number(p, ignored);
+}
+
+inline bool resetTimestamp(const char*& p, UsageReset& reset) {
+  if (consume(p, "null")) return true;
+  char text[513] = {};  // Covers the existing transport's entire 512-byte body.
+  if (!jsonString(p, text, sizeof(text))) return false;
+  reset = parseUsageReset(text);
+  return true;
 }
 
 inline bool percent(const char*& p, double& value) {
@@ -99,6 +123,8 @@ inline bool parse(const char* json, StatusData& status) {
     else if (consume(p, "\"usage_observed_at\"")) field = 8;
     else if (consume(p, "\"usage_stale\"")) field = 16;
     else if (consume(p, "\"last_result\"")) field = 32;
+    else if (consume(p, "\"usage_5h_resets_at\"")) field = 64;
+    else if (consume(p, "\"usage_7d_resets_at\"")) field = 128;
     else return false;
     if ((seen & field) || !consume(p, ":")) return false;
     seen |= field;
@@ -114,6 +140,9 @@ inline bool parse(const char* json, StatusData& status) {
       if (!percent(p, parsed.usage.sevenDay)) return false;
     } else if (field == 8) {
       if (!timestamp(p)) return false;
+    } else if (field == 64 || field == 128) {
+      if (!resetTimestamp(p, field == 64 ? parsed.usage.fiveHourReset :
+                                         parsed.usage.sevenDayReset)) return false;
     } else if (field == 32) {
       if (consume(p, "null")) parsed.lastResult = LastResult::NONE;
       else if (consume(p, "\"SUCCESS\"")) parsed.lastResult = LastResult::SUCCESS;
@@ -128,7 +157,7 @@ inline bool parse(const char* json, StatusData& status) {
     if (!consume(p, ",")) return false;
   }
   skipSpace(p);
-  if (seen != 63 || *p != '\0') return false;
+  if (seen != 255 || *p != '\0') return false;
   status = parsed;
   return true;
 }

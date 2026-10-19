@@ -1,14 +1,35 @@
 #include "pet_ui.h"
 #include <M5Unified.h>
+#include "page_navigation.h"
 
 namespace {
 PetState currentState = PetState::SLEEP;
 TransportState transport = TransportState::CONNECTING;
 LastResult lastResult = LastResult::NONE;
 Usage currentUsage;
+DeviceInfo currentDevice;
+PageNavigation navigation;
+bool setupScreen = false;
 
 constexpr uint16_t kBackground = TFT_BLACK;
 constexpr uint16_t kMuted = 0x8410;
+
+void deviceRow(const char* label, const char* value, int y) {
+  auto& lcd = M5.Display;
+  lcd.fillRect(0, y, lcd.width(), 26, kBackground);
+  lcd.setTextColor(kMuted, kBackground);
+  lcd.drawString(label, 8, y);
+  char fitted[64];
+  DeviceText::fit(value, fitted, sizeof(fitted), (lcd.width() - 16) / 6);
+  lcd.setTextColor(TFT_WHITE, kBackground);
+  lcd.drawString(fitted, 8, y + 13);
+}
+
+void renderRssi() {
+  char rssi[24] = "--";
+  if (currentDevice.hasRssi) snprintf(rssi, sizeof(rssi), "%ld dBm", long(currentDevice.rssi));
+  deviceRow("RSSI", rssi, 98);
+}
 
 void renderConnection() {
   auto& lcd = M5.Display;
@@ -21,6 +42,21 @@ void renderConnection() {
   lcd.drawCenterString(label, lcd.width() / 2, 227);
 }
 
+void renderDevice() {
+  auto& lcd = M5.Display;
+  lcd.fillScreen(kBackground);
+  lcd.setTextColor(TFT_WHITE, kBackground);
+  lcd.drawCenterString("DEVICE", lcd.width() / 2, 8);
+  deviceRow("Wi-Fi SSID", currentDevice.ssid, 32);
+  deviceRow("DEVICE IP", currentDevice.ipv4, 65);
+  renderRssi();
+  deviceRow("BRIDGE IP", currentDevice.bridge, 131);
+  deviceRow("Firmware", DeviceText::kFirmwareVersion, 164);
+  lcd.setTextColor(kMuted, kBackground);
+  lcd.drawCenterString("BtnA: PET", lcd.width() / 2, 207);
+  renderConnection();
+}
+
 void renderHistory() {
   auto& lcd = M5.Display;
   lcd.fillRect(0, 213, lcd.width(), 10, kBackground);
@@ -30,13 +66,19 @@ void renderHistory() {
                        lcd.width() / 2, 213);
 }
 
-void drawUsageRow(const char* label, double percent, int y) {
+void drawUsageRow(const char* label, const UsageReset& reset, bool fiveHour,
+                  double percent, int y) {
   auto& lcd = M5.Display;
   const int barWidth = lcd.width() - 16;
   lcd.setTextColor(TFT_WHITE, kBackground);
   lcd.setCursor(8, y);
-  if (percent < 0) lcd.printf("%s      --%%", label);
-  else lcd.printf("%s      %.0f%%", label, percent);
+  char resetLabel[7];
+  reset.label(resetLabel, sizeof(resetLabel), fiveHour);
+  lcd.printf("%s %s", label, resetLabel);
+  char used[8];
+  if (percent < 0) snprintf(used, sizeof(used), "--%%");
+  else snprintf(used, sizeof(used), "%.0f%%", percent);
+  lcd.drawRightString(used, lcd.width() - 8, y);
   lcd.drawRect(8, y + 13, barWidth, 9, kMuted);
   if (percent >= 0) {
     lcd.fillRect(9, y + 14, static_cast<int>((barWidth - 2) * percent / 100),
@@ -50,8 +92,8 @@ void renderUsage() {
   lcd.setTextColor(currentUsage.stale ? TFT_YELLOW : TFT_WHITE, kBackground);
   lcd.drawCenterString(currentUsage.stale ? "USAGE STALE" : "USAGE",
                        lcd.width() / 2, 8);
-  drawUsageRow("5h", currentUsage.fiveHour, 28);
-  drawUsageRow("7d", currentUsage.sevenDay, 61);
+  drawUsageRow("5h", currentUsage.fiveHourReset, true, currentUsage.fiveHour, 28);
+  drawUsageRow("7d", currentUsage.sevenDayReset, false, currentUsage.sevenDay, 61);
 }
 
 void renderPet(PetState state) {
@@ -115,6 +157,9 @@ void renderPet(PetState state) {
 }  // namespace
 
 void PetUi::begin() {
+  navigation = PageNavigation{};
+  setupScreen = false;
+  currentDevice = DeviceInfo{};
   M5.Display.setRotation(0);  // Portrait: 135 x 240.
   M5.Display.setBrightness(128);
   M5.Display.setTextFont(1);
@@ -133,36 +178,59 @@ void PetUi::begin() {
 void PetUi::setState(PetState state) {
   if (state == currentState) return;
   currentState = state;
-  renderPet(state);
+  if (!setupScreen && !navigation.devicePage()) renderPet(state);
 }
 
 void PetUi::setTransport(TransportState value) {
   if (transport == value) return;
   transport = value;
-  renderConnection();
+  if (!setupScreen) renderConnection();
 }
 
 void PetUi::setLastResult(LastResult result) {
   if (lastResult == result) return;
   lastResult = result;
-  renderHistory();
+  if (!setupScreen && !navigation.devicePage()) renderHistory();
 }
 
-void PetUi::showSetup(const char* apName) {
+void PetUi::showSetup() {
+  setupScreen = true;
+  navigation.enterSetup();
   auto& lcd = M5.Display;
   lcd.fillScreen(kBackground);
   lcd.setTextColor(TFT_YELLOW, kBackground);
   lcd.setCursor(4, 12);
-  lcd.print("SETUP WI-FI");
+  lcd.print("USB SETUP");
   lcd.setTextColor(TFT_WHITE, kBackground);
   lcd.setCursor(4, 40);
-  lcd.print("Join Wi-Fi:\n");
-  lcd.println(apName);
-  lcd.print("\nOpen browser:\nhttp://192.168.4.1\n\nSave Wi-Fi to restart.\n\nBoot: hold BtnA\nto reconfigure.");
+  lcd.print("Connect USB\nRun on computer:\npython3 scripts/\ncodex_pet_setup.py\n\nOr serial 115200\nType HELP\nSave then reboot");
 }
 
 void PetUi::setUsage(const Usage& usage) {
   if (usage == currentUsage) return;
   currentUsage = usage;
-  renderUsage();
+  if (!setupScreen && !navigation.devicePage()) renderUsage();
+}
+
+void PetUi::setDeviceInfo(const DeviceInfo& info) {
+  if (info == currentDevice) return;
+  const DeviceInfo previous = currentDevice;
+  currentDevice = info;
+  if (setupScreen || !navigation.devicePage()) return;
+  if (strcmp(previous.ssid, info.ssid) != 0) deviceRow("Wi-Fi SSID", info.ssid, 32);
+  if (strcmp(previous.ipv4, info.ipv4) != 0) deviceRow("DEVICE IP", info.ipv4, 65);
+  if (previous.hasRssi != info.hasRssi || (info.hasRssi && previous.rssi != info.rssi)) renderRssi();
+  if (strcmp(previous.bridge, info.bridge) != 0) deviceRow("BRIDGE IP", info.bridge, 131);
+}
+
+void PetUi::updateButton(bool pressed, uint32_t now) {
+  if (!navigation.update(pressed, now)) return;
+  if (navigation.devicePage()) {
+    renderDevice();
+  } else {
+    M5.Display.fillScreen(kBackground);
+    renderUsage();
+    M5.Display.drawFastHLine(8, 96, M5.Display.width() - 16, kMuted);
+    renderPet(currentState);
+  }
 }

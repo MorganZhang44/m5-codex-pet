@@ -15,10 +15,10 @@ int main() {
   for (auto delay : {2000, 4000, 8000, 16000, 30000, 30000}) assert(http.take() == unsigned(delay));
   http.reset();
   assert(http.take() == 2000);
-  Backoff wifi(10000);
-  for (auto delay : {10000, 20000, 30000, 30000}) assert(wifi.take() == unsigned(delay));
+  Backoff wifi(20000);
+  for (auto delay : {20000, 30000, 30000}) assert(wifi.take() == unsigned(delay));
   wifi.reset();
-  assert(wifi.take() == 10000);
+  assert(wifi.take() == 20000);
   Timer timer;
   timer.arm(UINT32_MAX - 100, 2000);
   assert(!timer.due(1898));
@@ -56,4 +56,10 @@ int main() {
   assert(choose(false, true, false, true) == Source::SETUP);
   for (bool saved : {false, true}) for (bool valid : {false, true})
     assert(choose(true, saved, valid, true) == Source::SETUP);
+  assert(afterAssociationTimeout(Source::SAVED, true) == Source::LEGACY);
+  assert(afterAssociationTimeout(Source::SAVED, false) == Source::SAVED);
+  for (bool legacy : {false, true}) {
+    assert(afterAssociationTimeout(Source::SETUP, legacy) == Source::SETUP);
+    assert(afterAssociationTimeout(Source::LEGACY, legacy) == Source::LEGACY);
+  }
 }

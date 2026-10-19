@@ -3,57 +3,35 @@
 #include <Arduino.h>
 #include <HTTPClient.h>
 #include <WiFi.h>
-#include <ESPmDNS.h>
-#include "pet_config.h"
+#include "bridge_config.h"
 #include "status_parser.h"
 #include "wifi_config.h"
 
 namespace {
 constexpr uint16_t kTimeoutMs = 750;
-constexpr uint32_t kDiscoveryRefreshMs = 60000;
-NetworkPolicy::Timer pollTimer, wifiTimer, discoveryTimer;
+NetworkPolicy::Timer pollTimer, wifiTimer;
 NetworkPolicy::Backoff httpBackoff;
-NetworkPolicy::Backoff wifiBackoff(10000);
+NetworkPolicy::Backoff wifiBackoff(WifiConfig::kAssociationTimeoutMs);
 TransportState transportState = TransportState::CONNECTING;
 bool hadWifi = false;
-bool mdnsStarted = false;
 String endpoint;
+String bridgeAddress;
 uint16_t endpointPort = 0;
 IPAddress localAddress;
 
-void invalidateDiscovery() {
+void invalidateEndpoint() {
   endpoint = "";
+  bridgeAddress = "";
   endpointPort = 0;
-  if (mdnsStarted) MDNS.end();
-  mdnsStarted = false;
-  discoveryTimer.arm(millis(), 0);
+  BridgeConfig::resetDiscovery();
 }
 
-bool discover() {
-  if (!mdnsStarted) {
-    String name = "codex-pet-" + String(uint32_t(ESP.getEfuseMac() & 0xffffff), HEX);
-    mdnsStarted = MDNS.begin(name.c_str());
-  }
-  int selected = -1;
-  if (mdnsStarted) {
-    const int count = MDNS.queryService("_codex-pet", "_tcp");
-    for (int i = 0; i < count; ++i) {
-      if (MDNS.IP(i) == IPAddress() || MDNS.port(i) == 0) continue;
-      // Arduino 2.0.17 has no result instance-name accessor: first usable
-      // IPv4 result in API index order wins; never infer it from hostname/TXT.
-      selected = i;
-      break;
-    }
-  }
-  if (selected >= 0) {
-    endpoint = MDNS.IP(selected).toString();
-    endpointPort = MDNS.port(selected);
-  } else {
-    endpoint = PET_STATUS_HOST;
-    endpointPort = PET_STATUS_PORT > 0 && PET_STATUS_PORT <= 65535 ? PET_STATUS_PORT : 0;
-  }
-  discoveryTimer.arm(millis(), kDiscoveryRefreshMs);
-  return !endpoint.isEmpty() && endpointPort != 0;
+bool resolveCurrent() {
+  BridgeConfig::Service bridge;
+  if (!BridgeConfig::resolve(bridge)) return false;
+  endpoint = bridge.host;
+  endpointPort = bridge.port;
+  return true;
 }
 
 // Bound response memory, including chunked responses, without a JSON dependency.
@@ -86,23 +64,33 @@ void HttpStateSource::begin(bool maintenance) {
   pollTimer.arm(millis(), 0);
 }
 
+void HttpStateSource::enterSetup() {
+  if (WifiConfig::setupMode()) return;
+  invalidateEndpoint();
+  WifiConfig::enterSetup();
+  transportState = TransportState::SETUP;
+}
+
 bool HttpStateSource::poll(uint32_t now, StatusData& status) {
-  WifiConfig::service(now);
+  WifiConfig::service();
   if (WifiConfig::setupMode()) return false;
   if (WiFi.status() != WL_CONNECTED) {
     if (hadWifi) {
       hadWifi = false;
       transportState = TransportState::OFFLINE;
-      invalidateDiscovery();
+      invalidateEndpoint();
       wifiBackoff.reset();
-      wifiTimer.arm(now, wifiBackoff.take());
+      // Give the current credentials a fresh full attempt after a link loss.
+      // Only its timeout may select the legacy fallback.
+      WifiConfig::connect();
+      wifiTimer.arm(millis(), wifiBackoff.take());
+      return false;
     }
     // Initial association is CONNECTING; subsequent failed attempts are OFFLINE.
     if (transportState == TransportState::ONLINE) transportState = TransportState::OFFLINE;
     if (wifiTimer.due(now)) {
       transportState = TransportState::OFFLINE;
-      WiFi.disconnect();
-      WifiConfig::connect();
+      WifiConfig::retry();
       wifiTimer.arm(millis(), wifiBackoff.take());
     }
     return false;
@@ -110,7 +98,7 @@ bool HttpStateSource::poll(uint32_t now, StatusData& status) {
   if (!hadWifi || localAddress != WiFi.localIP()) {
     hadWifi = true;
     localAddress = WiFi.localIP();
-    invalidateDiscovery();
+    invalidateEndpoint();
     wifiBackoff.reset();
     httpBackoff.reset();
     pollTimer.arm(now, 0);
@@ -118,7 +106,7 @@ bool HttpStateSource::poll(uint32_t now, StatusData& status) {
   }
   if (!pollTimer.due(now)) return false;
   bool valid = false;
-  if ((!endpoint.isEmpty() && !discoveryTimer.due(now)) || discover()) {
+  if (resolveCurrent()) {
     WiFiClient client;
     HTTPClient http;
     http.setConnectTimeout(kTimeoutMs);
@@ -133,17 +121,34 @@ bool HttpStateSource::poll(uint32_t now, StatusData& status) {
       http.end();
     }
   }
-  // Schedule from completion: a slow request/discovery cannot cause tight retries.
+  // Schedule from completion: a slow request/resolution cannot cause tight retries.
   if (valid) {
+    bridgeAddress = "";
+    IPAddress resolved;
+    if (resolved.fromString(endpoint) || WiFi.hostByName(endpoint.c_str(), resolved))
+      bridgeAddress = resolved.toString();
     transportState = TransportState::ONLINE;
     httpBackoff.reset();
     pollTimer.arm(millis(), NetworkPolicy::pollInterval(status.state));
   } else {
     transportState = TransportState::OFFLINE;
-    invalidateDiscovery();
+    invalidateEndpoint();
     pollTimer.arm(millis(), httpBackoff.take());
   }
   return valid;
 }
 
 TransportState HttpStateSource::transport() { return transportState; }
+
+DeviceInfo HttpStateSource::deviceInfo() {
+  DeviceInfo info;
+  // Read current station values even while HTTP is OFFLINE/CONNECTING. Do not
+  // substitute saved credentials or a cached DHCP address after Wi-Fi loss.
+  WiFi.SSID().toCharArray(info.ssid, sizeof(info.ssid));
+  const IPAddress ip = WiFi.localIP();
+  if (ip != IPAddress()) ip.toString().toCharArray(info.ipv4, sizeof(info.ipv4));
+  info.hasRssi = WiFi.status() == WL_CONNECTED;
+  if (info.hasRssi) info.rssi = WiFi.RSSI();
+  bridgeAddress.toCharArray(info.bridge, sizeof(info.bridge));
+  return info;
+}

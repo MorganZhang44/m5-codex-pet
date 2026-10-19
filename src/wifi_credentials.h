@@ -27,4 +27,9 @@ inline Source choose(bool maintenance, bool savedExists, bool savedValid,
   if (savedExists) return savedValid ? Source::SAVED : Source::SETUP;
   return legacyValid ? Source::LEGACY : Source::SETUP;
 }
+// A failed association may fall back for this boot only. Never changes NVS,
+// overrides maintenance/clear, or oscillates between credential pairs.
+inline Source afterAssociationTimeout(Source current, bool legacyValid) {
+  return current == Source::SAVED && legacyValid ? Source::LEGACY : current;
+}
 }  // namespace WifiCredentials
